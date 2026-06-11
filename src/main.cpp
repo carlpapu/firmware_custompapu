@@ -412,64 +412,7 @@ void startup_sound() {
  **  Where the devices are started and variables set
  *********************************************************************/
 void setup() {
-    Serial.setRxBufferSize(
-        SAFE_STACK_BUFFER_SIZE / 4
-    ); // Must be invoked before Serial.begin(). Default is 256 chars
     Serial.begin(115200);
-
-    log_d("Total heap: %d", ESP.getHeapSize());
-    log_d("Free heap: %d", ESP.getFreeHeap());
-    if (psramInit()) log_d("PSRAM Started");
-    if (psramFound()) log_d("PSRAM Found");
-    else log_d("PSRAM Not Found");
-    log_d("Total PSRAM: %d", ESP.getPsramSize());
-    log_d("Free PSRAM: %d", ESP.getFreePsram());
-
-    // declare variables
-    prog_handler = 0;
-    sdcardMounted = false;
-    wifiConnected = false;
-    BLEConnected = false;
-    bruceConfig.bright = 100; // theres is no value yet
-    bruceConfigPins.rotation = ROTATION;
-    setup_gpio();
-#if defined(HAS_SCREEN)
-    tft.init();
-    tft.setRotation(bruceConfigPins.rotation);
-    tft.fillScreen(TFT_BLACK);
-    // bruceConfig is not read yet.. just to show something on screen due to long boot time
-    tft.setTextColor(TFT_PURPLE, TFT_BLACK);
-    tft.drawCentreString("Booting", tft.width() / 2, tft.height() / 2, 1);
-#else
-    tft.begin();
-#endif
-    begin_storage();
-    begin_tft();
-    init_clock();
-    init_led();
-
-    options.reserve(20); // preallocate some options space to avoid fragmentation
-
-    // Set WiFi country to avoid warnings and ensure max power
-    const wifi_country_t country = {
-        .cc = "US",
-        .schan = 1,
-        .nchan = 14,
-#ifdef CONFIG_ESP_PHY_MAX_TX_POWER
-        .max_tx_power = CONFIG_ESP_PHY_MAX_TX_POWER, // 20
-#endif
-        .policy = WIFI_COUNTRY_POLICY_MANUAL
-    };
-
-    esp_wifi_set_max_tx_power(80); // 80 translates to 20dBm
-    esp_wifi_set_country(&country);
-
-    // Some GPIO Settings (such as CYD's brightness control must be set after tft and sdcard)
-    _post_setup_gpio();
-    // Some board interfaces initialize or reset the backlight in post-setup,
-    // so re-apply the stored brightness after that stage completes.
-    setBrightness(bruceConfig.bright, false);
-    // end of post gpio begin
 
     // 1. Configuramos el chip Wi-Fi del ESP32-S3 en modo inyección
     WiFi.mode(WIFI_STA);
@@ -479,6 +422,8 @@ void setup() {
     // 2. Preparamos el pin del LED Naranja de tu placa Seeed XIAO
     pinMode(21, OUTPUT);
     digitalWrite(21, HIGH); // Lo dejamos apagado al inicio
+
+    Serial.println("[XIAO S3] Inicializado correctamente en modo dedicado.");
 }
 
 /**********************************************************************
